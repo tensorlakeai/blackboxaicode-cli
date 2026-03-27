@@ -183,6 +183,227 @@ function entrypoint(workdir: string, cliArgs: string[]): string[] {
   return ['bash', '-c', args.join(' ')];
 }
 
+/**
+ * Starts a Tensorlake MicroVM sandbox and runs the blackbox CLI inside it.
+ *
+ * Tensorlake provides Firecracker-based MicroVM sandboxes with sub-second
+ * startup, durable filesystem, and auto suspend/resume.
+ *
+ * The sandbox lifecycle:
+ *  1. Create a new Tensorlake sandbox via `tl sbx new`
+ *  2. Copy the current working directory into the sandbox
+ *  3. Install Node.js + the blackbox CLI inside the sandbox
+ *  4. Forward the relevant environment variables
+ *  5. Execute `blackbox` with the original CLI arguments inside the sandbox
+ *  6. Stream stdout/stderr back to the host terminal
+ *  7. Terminate the sandbox on exit
+ *
+ * Required environment variables:
+ *  - TENSORLAKE_API_KEY  API key from https://cloud.tensorlake.ai
+ *
+ * Optional environment variables:
+ *  - TENSORLAKE_CPUS     Number of vCPUs for the sandbox (default: 2)
+ *  - TENSORLAKE_MEMORY   Memory in MB for the sandbox (default: 4096)
+ *  - TENSORLAKE_TIMEOUT  Sandbox timeout in seconds (default: 3600)
+ */
+async function start_tensorlake_sandbox(
+  nodeArgs: string[] = [],
+  cliConfig?: Config,
+  cliArgs: string[] = [],
+) {
+  const apiKey = process.env['TENSORLAKE_API_KEY'];
+  if (!apiKey) {
+    throw new FatalSandboxError(
+      'TENSORLAKE_API_KEY environment variable is required for Tensorlake sandbox. ' +
+        'Get your API key at https://cloud.tensorlake.ai',
+    );
+  }
+
+  const cpus = process.env['TENSORLAKE_CPUS'] ?? '2';
+  const memoryMb = process.env['TENSORLAKE_MEMORY'] ?? '4096';
+  const timeoutSecs = process.env['TENSORLAKE_TIMEOUT'] ?? '3600';
+
+  console.error(
+    `hopping into Tensorlake sandbox (cpus: ${cpus}, memory: ${memoryMb}MB) ...`,
+  );
+
+  // ── Step 1: Create sandbox ─────────────────────────────────────────────
+  let sandboxId: string;
+  try {
+    const createOutput = execSync(
+      `tl sbx new --cpus ${cpus} --memory ${memoryMb} --timeout ${timeoutSecs} --json`,
+      { env: { ...process.env }, encoding: 'utf-8' },
+    ).trim();
+    const parsed = JSON.parse(createOutput) as { sandbox_id?: string; id?: string };
+    sandboxId = parsed.sandbox_id ?? parsed.id ?? '';
+    if (!sandboxId) {
+      throw new Error(`unexpected response: ${createOutput}`);
+    }
+  } catch (err) {
+    // Some older tl versions don't support --json; fall back to text parsing
+    try {
+      const createOutput = execSync(
+        `tl sbx new --cpus ${cpus} --memory ${memoryMb} --timeout ${timeoutSecs}`,
+        { env: { ...process.env }, encoding: 'utf-8' },
+      ).trim();
+      // Attempt to parse a sandbox ID from output like "Created sandbox sbx-abc123"
+      const match = createOutput.match(/sbx-[a-zA-Z0-9]+/);
+      if (!match) {
+        throw new Error(`could not parse sandbox ID from: ${createOutput}`);
+      }
+      sandboxId = match[0];
+    } catch (fallbackErr) {
+      throw new FatalSandboxError(
+        `Failed to create Tensorlake sandbox: ${(fallbackErr as Error).message}`,
+      );
+    }
+  }
+
+  console.error(`Tensorlake sandbox created: ${sandboxId}`);
+
+  // Register cleanup handler to terminate sandbox on exit
+  const terminateSandbox = () => {
+    try {
+      console.error(`terminating Tensorlake sandbox ${sandboxId} ...`);
+      execSync(`tl sbx terminate ${sandboxId}`, {
+        env: { ...process.env },
+        stdio: 'pipe',
+      });
+    } catch {
+      // Best-effort cleanup; don't throw on exit
+    }
+  };
+  process.on('exit', terminateSandbox);
+  process.on('SIGINT', () => {
+    terminateSandbox();
+    process.exit(130);
+  });
+  process.on('SIGTERM', () => {
+    terminateSandbox();
+    process.exit(143);
+  });
+
+  const workdir = path.resolve(process.cwd());
+  const remotePath = `/workspace${workdir}`;
+
+  // ── Step 2: Copy workspace into sandbox ────────────────────────────────
+  console.error(`copying workspace into sandbox ...`);
+  try {
+    // Create target directory structure first
+    execSync(
+      `tl sbx exec ${sandboxId} -- mkdir -p ${remotePath}`,
+      { env: { ...process.env }, stdio: 'pipe', encoding: 'utf-8' },
+    );
+    execSync(
+      `tl sbx cp -r ${workdir}/. ${sandboxId}:${remotePath}/`,
+      { env: { ...process.env }, stdio: 'inherit', encoding: 'utf-8' },
+    );
+  } catch (err) {
+    throw new FatalSandboxError(
+      `Failed to copy workspace to Tensorlake sandbox ${sandboxId}: ${(err as Error).message}`,
+    );
+  }
+
+  // ── Step 3: Install Node.js + blackbox CLI inside the sandbox ──────────
+  console.error(`installing blackbox CLI inside sandbox ...`);
+  try {
+    // Install node via nvm for a hermetic environment; fall back to system node
+    const setupCmd = [
+      'export NVM_DIR="$HOME/.nvm"',
+      '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"',
+      'command -v node >/dev/null 2>&1 || (curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && apt-get install -y nodejs 2>/dev/null)',
+      'command -v blackbox >/dev/null 2>&1 || npm install -g @blackbox_ai/blackbox-cli 2>/dev/null',
+    ].join(' && ');
+    execSync(
+      `tl sbx exec ${sandboxId} -- bash -c ${quote([setupCmd])}`,
+      { env: { ...process.env }, stdio: 'pipe', encoding: 'utf-8' },
+    );
+  } catch {
+    // Non-fatal: the sandbox image may already have node/blackbox installed
+    console.error(
+      'Warning: pre-installation step failed — assuming blackbox is already available inside sandbox',
+    );
+  }
+
+  // ── Step 4: Build environment variable forwarding ──────────────────────
+  const forwardedEnvVars: string[] = [];
+  const envVarsToForward = [
+    'GEMINI_API_KEY',
+    'GOOGLE_API_KEY',
+    'OPENAI_API_KEY',
+    'OPENAI_BASE_URL',
+    'OPENAI_MODEL',
+    'BLACKBOX_API_KEY',
+    'TAVILY_API_KEY',
+    'GOOGLE_GENAI_USE_VERTEXAI',
+    'GOOGLE_GENAI_USE_GCA',
+    'GOOGLE_CLOUD_PROJECT',
+    'GOOGLE_CLOUD_LOCATION',
+    'GEMINI_MODEL',
+    'TERM',
+    'COLORTERM',
+    'BLACKBOX_CODE_IDE_SERVER_PORT',
+    'BLACKBOX_CODE_IDE_WORKSPACE_PATH',
+    'TERM_PROGRAM',
+    'TENSORLAKE_API_KEY',
+  ];
+  for (const varName of envVarsToForward) {
+    if (process.env[varName]) {
+      forwardedEnvVars.push(`${varName}=${quote([process.env[varName]!])}`);
+    }
+  }
+
+  // Forward NODE_OPTIONS
+  const existingNodeOptions = process.env['NODE_OPTIONS'] || '';
+  const allNodeOptions = [
+    ...(existingNodeOptions ? [existingNodeOptions] : []),
+    ...nodeArgs,
+  ]
+    .join(' ')
+    .trim();
+  if (allNodeOptions) {
+    forwardedEnvVars.push(`NODE_OPTIONS=${quote([allNodeOptions])}`);
+  }
+
+  // Mark that we are inside the sandbox so that the CLI does not try to re-enter
+  forwardedEnvVars.push(`SANDBOX=tensorlake-${sandboxId}`);
+
+  // ── Step 5: Execute blackbox inside the sandbox ────────────────────────
+  const quotedCliArgs = cliArgs.slice(2).map((arg) => quote([arg]));
+  const cliCmd =
+    process.env['NODE_ENV'] === 'development'
+      ? `cd ${remotePath} && npm rebuild && npm run start --`
+      : `cd ${remotePath} && blackbox`;
+
+  const remoteCmd = [
+    `export ${forwardedEnvVars.join(' ')}`,
+    cliCmd,
+    ...quotedCliArgs,
+  ].join(' ');
+
+  // ── Step 6: Stream execution ───────────────────────────────────────────
+  const sandboxProcess = spawn(
+    'tl',
+    ['sbx', 'exec', sandboxId, '--', 'bash', '-c', remoteCmd],
+    { stdio: 'inherit', env: { ...process.env } },
+  );
+
+  sandboxProcess.on('error', (err) => {
+    console.error(`Tensorlake sandbox process error: ${err.message}`);
+  });
+
+  await new Promise<void>((resolve) => {
+    sandboxProcess.on('close', (code, signal) => {
+      if (code !== 0 && code !== null) {
+        console.error(
+          `Tensorlake sandbox process exited with code: ${code}, signal: ${signal}`,
+        );
+      }
+      resolve();
+    });
+  });
+}
+
 export async function start_sandbox(
   config: SandboxConfig,
   nodeArgs: string[] = [],
@@ -343,6 +564,11 @@ export async function start_sandbox(
         stdio: 'inherit',
       });
       await new Promise((resolve) => sandboxProcess?.on('close', resolve));
+      return;
+    }
+
+    if (config.command === 'tensorlake') {
+      await start_tensorlake_sandbox(nodeArgs, cliConfig, cliArgs);
       return;
     }
 
@@ -636,6 +862,7 @@ export async function start_sandbox(
       'BLACKBOX_CODE_IDE_SERVER_PORT',
       'BLACKBOX_CODE_IDE_WORKSPACE_PATH',
       'TERM_PROGRAM',
+      'TENSORLAKE_API_KEY',
     ]) {
       if (process.env[envVar]) {
         args.push('--env', `${envVar}=${process.env[envVar]}`);

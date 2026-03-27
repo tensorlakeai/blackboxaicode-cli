@@ -22,6 +22,7 @@ const VALID_SANDBOX_COMMANDS: ReadonlyArray<SandboxConfig['command']> = [
   'docker',
   'podman',
   'sandbox-exec',
+  'tensorlake',
 ];
 
 function isSandboxCommand(value: string): value is SandboxConfig['command'] {
@@ -58,16 +59,18 @@ function getSandboxCommand(
         )}`,
       );
     }
+    // tensorlake uses the 'tl' CLI binary rather than the command name itself
+    const executableName = sandbox === 'tensorlake' ? 'tl' : sandbox;
     // confirm that specified command exists
-    if (commandExists.sync(sandbox)) {
+    if (commandExists.sync(executableName)) {
       return sandbox;
     }
     throw new FatalSandboxError(
-      `Missing sandbox command '${sandbox}' (from GEMINI_SANDBOX)`,
+      `Missing sandbox command '${executableName}' (from GEMINI_SANDBOX=${sandbox})`,
     );
   }
 
-  // look for seatbelt, docker, or podman, in that order
+  // look for seatbelt, docker, podman, or tensorlake, in that order
   // for container-based sandboxing, require sandbox to be enabled explicitly
   if (os.platform() === 'darwin' && commandExists.sync('sandbox-exec')) {
     return 'sandbox-exec';
@@ -75,13 +78,15 @@ function getSandboxCommand(
     return 'docker';
   } else if (commandExists.sync('podman') && sandbox === true) {
     return 'podman';
+  } else if (commandExists.sync('tl') && sandbox === true) {
+    return 'tensorlake';
   }
 
   // throw an error if user requested sandbox but no command was found
   if (sandbox === true) {
     throw new FatalSandboxError(
       'GEMINI_SANDBOX is true but failed to determine command for sandbox; ' +
-        'install docker or podman or specify command in GEMINI_SANDBOX',
+        'install docker, podman, or tensorlake CLI (tl) or specify command in GEMINI_SANDBOX',
     );
   }
 
@@ -94,6 +99,17 @@ export async function loadSandboxConfig(
 ): Promise<SandboxConfig | undefined> {
   const sandboxOption = argv.sandbox ?? settings.tools?.sandbox;
   const command = getSandboxCommand(sandboxOption);
+
+  if (!command) {
+    return undefined;
+  }
+
+  // Tensorlake manages its own sandbox images via the cloud platform.
+  // The 'image' field is not used for tensorlake sandboxes; we store a
+  // placeholder so the SandboxConfig shape remains consistent.
+  if (command === 'tensorlake') {
+    return { command, image: 'tensorlake' };
+  }
 
   const packageJson = await getPackageJson();
   const image =
