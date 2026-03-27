@@ -43,6 +43,17 @@ export const VSCODE_SHIFT_ENTER_SEQUENCE = '\\\r\n';
 export const BACKSLASH_ENTER_DETECTION_WINDOW_MS = 5;
 
 /**
+ * Escape code timeout in milliseconds for readline's keypress emitter.
+ *
+ * Over a network PTY (e.g. Tensorlake sandbox via WebSocket), escape sequences
+ * like arrow keys (ESC[A) can arrive in separate chunks. A timeout of 0 causes
+ * readline to emit the ESC immediately as a standalone key, breaking arrow keys
+ * and other multi-byte escape sequences. A small nonzero value gives readline
+ * enough time to buffer the full sequence without making the ESC key feel laggy.
+ */
+export const ESC_TIMEOUT_MS = 50;
+
+/**
  * Maximum expected length of a Kitty keyboard protocol sequence.
  * Format: ESC [ <keycode> ; <modifiers> u/~
  * Example: \x1b[13;2u (Shift+Enter) = 8 chars

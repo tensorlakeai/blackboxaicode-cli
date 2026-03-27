@@ -23,6 +23,7 @@ import { PassThrough } from 'node:stream';
 import {
   BACKSLASH_ENTER_DETECTION_WINDOW_MS,
   CHAR_CODE_ESC,
+  ESC_TIMEOUT_MS,
   KITTY_CTRL_C,
   KITTY_KEYCODE_BACKSPACE,
   KITTY_KEYCODE_ENTER,
@@ -448,13 +449,13 @@ export function KeypressProvider({
     if (usePassthrough) {
       rl = readline.createInterface({
         input: keypressStream,
-        escapeCodeTimeout: 0,
+        escapeCodeTimeout: ESC_TIMEOUT_MS,
       });
       readline.emitKeypressEvents(keypressStream, rl);
       keypressStream.on('keypress', handleKeypress);
       stdin.on('data', handleRawKeypress);
     } else {
-      rl = readline.createInterface({ input: stdin, escapeCodeTimeout: 0 });
+      rl = readline.createInterface({ input: stdin, escapeCodeTimeout: ESC_TIMEOUT_MS });
       readline.emitKeypressEvents(stdin, rl);
       stdin.on('keypress', handleKeypress);
     }
