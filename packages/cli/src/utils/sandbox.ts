@@ -183,6 +183,482 @@ function entrypoint(workdir: string, cliArgs: string[]): string[] {
   return ['bash', '-c', args.join(' ')];
 }
 
+/**
+ * Starts a Tensorlake MicroVM sandbox and runs the blackbox CLI inside it.
+ *
+ * Tensorlake provides Firecracker-based MicroVM sandboxes with sub-second
+ * startup, durable filesystem, and auto suspend/resume.
+ *
+ * The sandbox lifecycle:
+ *  1. Create a new Tensorlake sandbox via `tl sbx new`
+ *  2. Copy the current working directory into the sandbox
+ *  3. Install Node.js + the blackbox CLI inside the sandbox
+ *  4. Forward the relevant environment variables
+ *  5. Execute `blackbox` with the original CLI arguments inside the sandbox
+ *  6. Stream stdout/stderr back to the host terminal
+ *  7. Terminate the sandbox on exit
+ *
+ * Required environment variables:
+ *  - TENSORLAKE_API_KEY  API key from https://cloud.tensorlake.ai
+ *
+ * Optional environment variables:
+ *  - TENSORLAKE_CPUS     Number of vCPUs for the sandbox (default: 2)
+ *  - TENSORLAKE_MEMORY   Memory in MB for the sandbox (default: 4096)
+ *  - TENSORLAKE_TIMEOUT  Sandbox timeout in seconds (default: 3600)
+ */
+async function start_tensorlake_sandbox(
+  nodeArgs: string[] = [],
+  cliConfig?: Config,
+  cliArgs: string[] = [],
+) {
+  const apiKey = process.env['TENSORLAKE_API_KEY'];
+  if (!apiKey) {
+    throw new FatalSandboxError(
+      'TENSORLAKE_API_KEY environment variable is required for Tensorlake sandbox. ' +
+        'Get your API key at https://cloud.tensorlake.ai',
+    );
+  }
+
+  const cpus = process.env['TENSORLAKE_CPUS'] ?? '2';
+  const memoryMb = process.env['TENSORLAKE_MEMORY'] ?? '4096';
+  const timeoutSecs = process.env['TENSORLAKE_TIMEOUT'] ?? '3600';
+
+  console.error(
+    `hopping into Tensorlake sandbox (cpus: ${cpus}, memory: ${memoryMb}MB) ...`,
+  );
+
+  // ── Step 1: Create sandbox ─────────────────────────────────────────────
+  let sandboxId: string;
+  let rawCreateOutput = '';
+  try {
+    rawCreateOutput = execSync(
+      `tl sbx new --cpus ${cpus} --memory ${memoryMb} --timeout ${timeoutSecs}`,
+      { env: { ...process.env }, encoding: 'utf-8', stdio: 'pipe' },
+    ).trim();
+  } catch (execErr) {
+    const execError = execErr as NodeJS.ErrnoException & { stderr?: string; stdout?: string };
+    rawCreateOutput = (execError.stdout ?? '') + '\n' + (execError.stderr ?? '');
+  }
+  // Parse the sandbox ID from output like "Created sandbox g0btnkk8k996i0sfq14kj"
+  const sandboxIdMatch =
+    rawCreateOutput.match(/Created sandbox\s+([a-zA-Z0-9_-]+)/) ||
+    rawCreateOutput.match(/([a-zA-Z0-9_-]{10,})/);
+  if (!sandboxIdMatch) {
+    throw new FatalSandboxError(
+      `Failed to create Tensorlake sandbox: could not parse sandbox ID from: ${rawCreateOutput.trim()}`,
+    );
+  }
+  sandboxId = sandboxIdMatch[1]!;
+
+  console.error(`Tensorlake sandbox created: ${sandboxId}`);
+
+  // Register cleanup handler to terminate sandbox on exit.
+  // Only the 'exit' handler actually terminates — the signal handlers just
+  // call process.exit() so the 'exit' event fires exactly once.
+  const terminateSandbox = () => {
+    try {
+      console.error(`terminating Tensorlake sandbox ${sandboxId} ...`);
+      execSync(`tl sbx terminate ${sandboxId}`, {
+        env: { ...process.env },
+        stdio: 'pipe',
+      });
+    } catch {
+      // Best-effort cleanup; don't throw on exit
+    }
+  };
+  process.on('exit', terminateSandbox);
+  process.on('SIGINT', () => process.exit(130));
+  process.on('SIGTERM', () => process.exit(143));
+
+  // Wait for both the exec daemon AND the HTTP file API to be reachable.
+  // The VM may report "running" before its internal services are fully up.
+  // We probe the exec path first, then validate the file API with a test cp.
+  console.error(`waiting for sandbox to be ready ...`);
+  const MAX_READY_ATTEMPTS = 30;
+  for (let attempt = 1; attempt <= MAX_READY_ATTEMPTS; attempt++) {
+    try {
+      execSync(`tl sbx exec ${sandboxId} -- echo ready`, {
+        env: { ...process.env },
+        stdio: 'pipe',
+        encoding: 'utf-8',
+      });
+      break; // exec daemon is reachable
+    } catch {
+      if (attempt === MAX_READY_ATTEMPTS) {
+        throw new FatalSandboxError(
+          `Tensorlake sandbox ${sandboxId} did not become reachable after ${MAX_READY_ATTEMPTS} attempts`,
+        );
+      }
+      await new Promise((r) => setTimeout(r, 1000));
+    }
+  }
+
+  // Separately probe the HTTP file API used by `tl sbx cp`, which can lag
+  // behind the exec daemon becoming ready.
+  const MAX_FILE_API_ATTEMPTS = 20;
+  const probeFile = path.join(os.tmpdir(), `tl-probe-${sandboxId}`);
+  try {
+    fs.writeFileSync(probeFile, '');
+    for (let attempt = 1; attempt <= MAX_FILE_API_ATTEMPTS; attempt++) {
+      try {
+        execSync(
+          `tl sbx cp ${quote([probeFile])} ${sandboxId}:/tmp/${path.basename(probeFile)}`,
+          { env: { ...process.env }, stdio: 'pipe', encoding: 'utf-8' },
+        );
+        break; // file API is reachable
+      } catch {
+        if (attempt === MAX_FILE_API_ATTEMPTS) {
+          throw new FatalSandboxError(
+            `Tensorlake sandbox ${sandboxId} file API did not become reachable after ${MAX_FILE_API_ATTEMPTS} attempts`,
+          );
+        }
+        await new Promise((r) => setTimeout(r, 1500));
+      }
+    }
+  } finally {
+    try { fs.unlinkSync(probeFile); } catch { /* ignore */ }
+  }
+
+  const workdir = path.resolve(process.cwd());
+  const remotePath = `/workspace${workdir}`;
+  // Shell-safe single-quoted version of remotePath for use inside bash commands.
+  const remotePathQ = `'${remotePath.replace(/'/g, "'\\''")}'`;
+
+  // ── Step 2: Copy workspace into sandbox ────────────────────────────────
+  // tl sbx cp has a 2MB per-file upload limit, so we tar the workspace,
+  // split it into 2MB chunks, upload each chunk, and reassemble + extract
+  // inside the sandbox.
+  console.error(`copying workspace into sandbox ...`);
+  const tarPath = path.join(os.tmpdir(), `tl-workspace-${sandboxId}.tar.gz`);
+  const chunkPrefix = path.join(os.tmpdir(), `tl-ws-chunk-${sandboxId}-`);
+  try {
+    // Create target directory structure
+    execSync(
+      `tl sbx exec ${sandboxId} -- mkdir -p ${remotePathQ}`,
+      { env: { ...process.env }, stdio: 'pipe', encoding: 'utf-8' },
+    );
+
+    // Pack workspace (skip .git, node_modules, dist to keep size down)
+    execSync(
+      `tar -czf ${quote([tarPath])} -C ${quote([workdir])} --exclude='.git' --exclude='node_modules' --exclude='dist' .`,
+      { env: { ...process.env }, stdio: 'pipe' },
+    );
+
+    // Split into 1.8MB chunks (safely under the 2MB limit)
+    execSync(
+      `split -b 1800k ${quote([tarPath])} ${quote([chunkPrefix])}`,
+      { env: { ...process.env }, stdio: 'pipe' },
+    );
+
+    // Upload each chunk with exponential backoff retry
+    const chunks = fs.readdirSync(os.tmpdir())
+      .filter((f) => f.startsWith(path.basename(chunkPrefix)))
+      .sort()
+      .map((f) => path.join(os.tmpdir(), f));
+
+    const MAX_CHUNK_ATTEMPTS = 5;
+    for (const chunk of chunks) {
+      let lastErr: Error | undefined;
+      for (let attempt = 1; attempt <= MAX_CHUNK_ATTEMPTS; attempt++) {
+        try {
+          execSync(
+            `tl sbx cp ${quote([chunk])} ${sandboxId}:/tmp/${path.basename(chunk)}`,
+            { env: { ...process.env }, stdio: 'pipe', encoding: 'utf-8' },
+          );
+          lastErr = undefined;
+          break;
+        } catch (err) {
+          lastErr = err as Error;
+          if (attempt < MAX_CHUNK_ATTEMPTS) {
+            // Exponential backoff: 1s, 2s, 4s, 8s
+            await new Promise((r) => setTimeout(r, 1000 * 2 ** (attempt - 1)));
+          }
+        }
+      }
+      if (lastErr) throw lastErr;
+    }
+
+    // Reassemble and extract inside the sandbox
+    const chunkBasename = path.basename(chunkPrefix);
+    const reassembleCmd = `cat /tmp/${chunkBasename}* > /tmp/workspace.tar.gz && tar -xzf /tmp/workspace.tar.gz -C ${remotePathQ} && rm -f /tmp/${chunkBasename}* /tmp/workspace.tar.gz`;
+    execSync(
+      `tl sbx exec ${sandboxId} -- bash -c ${quote([reassembleCmd])}`,
+      { env: { ...process.env }, stdio: 'pipe', encoding: 'utf-8' },
+    );
+  } catch (err) {
+    throw new FatalSandboxError(
+      `Failed to copy workspace to Tensorlake sandbox ${sandboxId}: ${(err as Error).message}`,
+    );
+  } finally {
+    // Clean up local temp files
+    try { fs.unlinkSync(tarPath); } catch { /* ignore */ }
+    const chunks = fs.readdirSync(os.tmpdir())
+      .filter((f) => f.startsWith(path.basename(chunkPrefix)));
+    for (const f of chunks) {
+      try { fs.unlinkSync(path.join(os.tmpdir(), f)); } catch { /* ignore */ }
+    }
+  }
+
+  // ── Step 2.5: Copy local user config (~/.blackboxcli/) into sandbox ───
+  // The Docker/Podman backend mounts USER_SETTINGS_DIR via volume binds so
+  // settings, API keys, and sandbox.bashrc are immediately available.  The
+  // Tensorlake backend has no volume-mount equivalent, so we replicate the
+  // same directory by taring it up and uploading it with the same chunked
+  // approach used for the workspace.
+  if (fs.existsSync(USER_SETTINGS_DIR)) {
+    console.error(`copying local config into sandbox ...`);
+    const configTarPath = path.join(os.tmpdir(), `tl-config-${sandboxId}.tar.gz`);
+    const configChunkPrefix = path.join(os.tmpdir(), `tl-cfg-chunk-${sandboxId}-`);
+    const remoteConfigDir = '/root/.blackboxcli';
+    try {
+      // Create the settings directory in the sandbox
+      execSync(
+        `tl sbx exec ${sandboxId} -- mkdir -p ${remoteConfigDir}`,
+        { env: { ...process.env }, stdio: 'pipe', encoding: 'utf-8' },
+      );
+
+      // Pack the settings directory
+      execSync(
+        `tar -czf ${quote([configTarPath])} -C ${quote([path.dirname(USER_SETTINGS_DIR)])} ${quote([path.basename(USER_SETTINGS_DIR)])}`,
+        { env: { ...process.env }, stdio: 'pipe' },
+      );
+
+      // Split into 1.8MB chunks (safely under the 2MB limit)
+      execSync(
+        `split -b 1800k ${quote([configTarPath])} ${quote([configChunkPrefix])}`,
+        { env: { ...process.env }, stdio: 'pipe' },
+      );
+
+      // Upload each chunk with retry
+      const configChunks = fs.readdirSync(os.tmpdir())
+        .filter((f) => f.startsWith(path.basename(configChunkPrefix)))
+        .sort()
+        .map((f) => path.join(os.tmpdir(), f));
+
+      const MAX_CONFIG_CHUNK_ATTEMPTS = 5;
+      for (const chunk of configChunks) {
+        let lastErr: Error | undefined;
+        for (let attempt = 1; attempt <= MAX_CONFIG_CHUNK_ATTEMPTS; attempt++) {
+          try {
+            execSync(
+              `tl sbx cp ${quote([chunk])} ${sandboxId}:/tmp/${path.basename(chunk)}`,
+              { env: { ...process.env }, stdio: 'pipe', encoding: 'utf-8' },
+            );
+            lastErr = undefined;
+            break;
+          } catch (err) {
+            lastErr = err as Error;
+            if (attempt < MAX_CONFIG_CHUNK_ATTEMPTS) {
+              await new Promise((r) => setTimeout(r, 1000 * 2 ** (attempt - 1)));
+            }
+          }
+        }
+        if (lastErr) throw lastErr;
+      }
+
+      // Reassemble and extract inside the sandbox at /root/
+      const configChunkBasename = path.basename(configChunkPrefix);
+      const configReassembleCmd = `cat /tmp/${configChunkBasename}* > /tmp/config.tar.gz && tar -xzf /tmp/config.tar.gz -C /root/ && rm -f /tmp/${configChunkBasename}* /tmp/config.tar.gz`;
+      execSync(
+        `tl sbx exec ${sandboxId} -- bash -c ${quote([configReassembleCmd])}`,
+        { env: { ...process.env }, stdio: 'pipe', encoding: 'utf-8' },
+      );
+    } catch (err) {
+      // Non-fatal: log a warning but continue — the CLI will start with default settings
+      console.error(
+        `Warning: failed to copy local config to Tensorlake sandbox: ${(err as Error).message}`,
+      );
+    } finally {
+      try { fs.unlinkSync(configTarPath); } catch { /* ignore */ }
+      const configChunks = fs.readdirSync(os.tmpdir())
+        .filter((f) => f.startsWith(path.basename(configChunkPrefix)));
+      for (const f of configChunks) {
+        try { fs.unlinkSync(path.join(os.tmpdir(), f)); } catch { /* ignore */ }
+      }
+    }
+  }
+
+  // ── Step 3: Install Node.js + blackbox CLI inside the sandbox ──────────
+  console.error(`installing blackbox CLI inside sandbox ...`);
+  try {
+    // Install node via nvm for a hermetic environment; fall back to system node.
+    // After installing, emit the resolved blackbox binary path so we can use an
+    // absolute path in the exec command (avoids PATH issues in non-login shells).
+    const setupCmd = [
+      'export NVM_DIR="$HOME/.nvm"',
+      '[ -s "$NVM_DIR/nvm.sh" ] && . "$NVM_DIR/nvm.sh"',
+      'command -v node >/dev/null 2>&1 || (curl -fsSL https://deb.nodesource.com/setup_20.x | bash - && apt-get install -y nodejs 2>/dev/null)',
+      'command -v blackbox >/dev/null 2>&1 || npm install -g @blackbox_ai/blackbox-cli 2>/dev/null',
+      'echo "BLACKBOX_BIN=$(command -v blackbox 2>/dev/null || npm root -g 2>/dev/null | xargs -I{} find {} -name blackbox -type f 2>/dev/null | head -1)"',
+    ].join(' && ');
+    const installOutput = execSync(
+      `tl sbx exec ${sandboxId} -- bash -c ${quote([setupCmd])}`,
+      { env: { ...process.env }, stdio: 'pipe', encoding: 'utf-8' },
+    );
+    const binMatch = installOutput.match(/^BLACKBOX_BIN=(.+)$/m);
+    if (binMatch?.[1]?.trim()) {
+      process.env['_TENSORLAKE_BLACKBOX_BIN'] = binMatch[1].trim();
+    }
+  } catch {
+    // Non-fatal: the sandbox image may already have node/blackbox installed
+    console.error(
+      'Warning: pre-installation step failed — assuming blackbox is already available inside sandbox',
+    );
+  }
+
+  // ── Step 4: Build environment variable forwarding ──────────────────────
+  const forwardedEnvVars: string[] = [];
+  const envVarsToForward = [
+    'GEMINI_API_KEY',
+    'GOOGLE_API_KEY',
+    'OPENAI_API_KEY',
+    'OPENAI_BASE_URL',
+    'OPENAI_MODEL',
+    'BLACKBOX_API_KEY',
+    'TAVILY_API_KEY',
+    'GOOGLE_GENAI_USE_VERTEXAI',
+    'GOOGLE_GENAI_USE_GCA',
+    'GOOGLE_CLOUD_PROJECT',
+    'GOOGLE_CLOUD_LOCATION',
+    'GEMINI_MODEL',
+    'TERM',
+    'COLORTERM',
+    'BLACKBOX_CODE_IDE_SERVER_PORT',
+    'BLACKBOX_CODE_IDE_WORKSPACE_PATH',
+    'TERM_PROGRAM',
+    'TENSORLAKE_API_KEY',
+  ];
+  for (const varName of envVarsToForward) {
+    if (process.env[varName]) {
+      forwardedEnvVars.push(`${varName}=${quote([process.env[varName]!])}`);
+    }
+  }
+
+  // Forward NODE_OPTIONS
+  const existingNodeOptions = process.env['NODE_OPTIONS'] || '';
+  const allNodeOptions = [
+    ...(existingNodeOptions ? [existingNodeOptions] : []),
+    ...nodeArgs,
+  ]
+    .join(' ')
+    .trim();
+  if (allNodeOptions) {
+    forwardedEnvVars.push(`NODE_OPTIONS=${quote([allNodeOptions])}`);
+  }
+
+  // Mark that we are inside the sandbox so that the CLI does not try to re-enter
+  forwardedEnvVars.push(`SANDBOX=tensorlake-${sandboxId}`);
+
+  // Ensure HOME is set to /root inside the sandbox so that os.homedir() resolves
+  // correctly (tl sbx exec runs as root; without this, $HOME may be unset or '/'
+  // causing settings to land at /.blackboxcli/settings.json instead of
+  // /root/.blackboxcli/settings.json).
+  forwardedEnvVars.push(`HOME=/root`);
+
+  // ── Step 5: Execute blackbox inside the sandbox ────────────────────────
+  const quotedCliArgs = cliArgs.slice(2).map((arg) => quote([arg]));
+  // Use the absolute path resolved during install if available so the binary
+  // is found even when the remote shell's PATH doesn't include npm's global bin.
+  const blackboxBin = process.env['_TENSORLAKE_BLACKBOX_BIN'] || 'blackbox';
+  delete process.env['_TENSORLAKE_BLACKBOX_BIN'];
+  const cliCmd =
+    process.env['NODE_ENV'] === 'development'
+      ? `cd ${remotePathQ} && npm rebuild && npm run start --`
+      : `cd ${remotePathQ} && ${blackboxBin}`;
+
+  // Source sandbox.bashrc files in the same order as the Docker entrypoint:
+  //  1. User-level:    ~/.blackboxcli/sandbox.bashrc
+  //  2. Project-level: <workspace>/.blackboxcli/sandbox.bashrc
+  const bashrcCmds: string[] = [
+    `[ -f /root/.blackboxcli/sandbox.bashrc ] && source /root/.blackboxcli/sandbox.bashrc`,
+    `[ -f ${remotePathQ}/.blackboxcli/sandbox.bashrc ] && source ${remotePathQ}/.blackboxcli/sandbox.bashrc`,
+  ];
+
+  const remoteCmd = [
+    ...forwardedEnvVars.map((v) => `export ${v}`),
+    ...bashrcCmds,
+    [cliCmd, ...quotedCliArgs].join(' '),
+  ].join('; ');
+
+  // ── Step 6: Stream execution ───────────────────────────────────────────
+  // `tl sbx exec` has no TTY support (-t means --timeout there).
+  // For interactive use we write the startup script to the sandbox and use
+  // `tl sbx ssh --shell <script>` which allocates a proper PTY via SSH.
+  // For non-interactive (piped / --prompt) we stay with `tl sbx exec`.
+  const isInteractive = process.stdin.isTTY || process.stdout.isTTY;
+  let spawnCmd: string;
+  let spawnArgs: string[];
+  let remoteStartScript: string | undefined;
+
+  if (isInteractive) {
+    // Write remoteCmd as an executable script inside the sandbox so that
+    // `tl sbx ssh --shell` can run it as the login shell (gives blackbox a TTY).
+    remoteStartScript = `/tmp/bb-start-${sandboxId}.sh`;
+    // Save the PTY's original terminal settings before blackbox sets raw mode,
+    // then restore them on exit. This prevents the SSH PTY's line discipline
+    // from double-processing key sequences (arrow keys, Ctrl combos, etc.) that
+    // blackbox expects to handle itself via Node's raw-mode stdin.
+    // We also propagate the inner exit code so the outer process exits correctly.
+    const scriptContent = [
+      '#!/bin/bash',
+      '_BB_ORIG_STTY=$(stty -g 2>/dev/null || true)',
+      'trap \'[ -n "$_BB_ORIG_STTY" ] && stty "$_BB_ORIG_STTY" 2>/dev/null || true\' EXIT',
+      // Run the actual command and capture its exit code
+      `( ${remoteCmd} )`,
+      '_BB_EXIT=$?',
+      // Clean up this script file inside the sandbox
+      `rm -f ${remoteStartScript}`,
+      'exit $_BB_EXIT',
+    ].join('\n') + '\n';
+    const localScript = path.join(os.tmpdir(), `bb-start-${sandboxId}.sh`);
+    fs.writeFileSync(localScript, scriptContent, { mode: 0o755 });
+    try {
+      execSync(`tl sbx cp ${quote([localScript])} ${sandboxId}:${remoteStartScript}`, {
+        env: { ...process.env },
+        stdio: 'pipe',
+      });
+      execSync(`tl sbx exec ${sandboxId} -- chmod +x ${remoteStartScript}`, {
+        env: { ...process.env },
+        stdio: 'pipe',
+      });
+    } finally {
+      try { fs.unlinkSync(localScript); } catch { /* ignore */ }
+    }
+    spawnCmd = 'tl';
+    spawnArgs = ['sbx', 'ssh', sandboxId, '--shell', remoteStartScript];
+  } else {
+    spawnCmd = 'tl';
+    spawnArgs = ['sbx', 'exec', sandboxId, '--', 'bash', '-c', remoteCmd];
+  }
+
+  const sandboxProcess = spawn(spawnCmd, spawnArgs, {
+    stdio: 'inherit',
+    env: { ...process.env },
+  });
+
+  sandboxProcess.on('error', (err) => {
+    console.error(`Tensorlake sandbox process error: ${err.message}`);
+  });
+
+  await new Promise<void>((resolve) => {
+    sandboxProcess.on('close', (code, signal) => {
+      if (code !== 0 && code !== null) {
+        console.error(
+          `Tensorlake sandbox process exited with code: ${code}, signal: ${signal}`,
+        );
+      }
+      // Propagate the sandbox's exit code to the host process so that callers
+      // (e.g. CI scripts, shell pipelines) see the correct exit status.
+      if (code !== null && code !== 0) {
+        process.exitCode = code;
+      } else if (signal) {
+        process.exitCode = 1;
+      }
+      resolve();
+    });
+  });
+}
+
 export async function start_sandbox(
   config: SandboxConfig,
   nodeArgs: string[] = [],
@@ -343,6 +819,11 @@ export async function start_sandbox(
         stdio: 'inherit',
       });
       await new Promise((resolve) => sandboxProcess?.on('close', resolve));
+      return;
+    }
+
+    if (config.command === 'tensorlake') {
+      await start_tensorlake_sandbox(nodeArgs, cliConfig, cliArgs);
       return;
     }
 
@@ -636,6 +1117,7 @@ export async function start_sandbox(
       'BLACKBOX_CODE_IDE_SERVER_PORT',
       'BLACKBOX_CODE_IDE_WORKSPACE_PATH',
       'TERM_PROGRAM',
+      'TENSORLAKE_API_KEY',
     ]) {
       if (process.env[envVar]) {
         args.push('--env', `${envVar}=${process.env[envVar]}`);

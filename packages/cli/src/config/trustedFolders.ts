@@ -6,14 +6,16 @@
 
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { homedir } from 'node:os';
 import { getErrorMessage, isWithinRoot } from '@blackbox_ai/blackbox-cli-core';
 import type { Settings } from './settings.js';
+import {
+  SETTINGS_DIRECTORY_NAME,
+  USER_SETTINGS_DIR,
+} from './settings.js';
 import stripJsonComments from 'strip-json-comments';
 
+export { SETTINGS_DIRECTORY_NAME, USER_SETTINGS_DIR };
 export const TRUSTED_FOLDERS_FILENAME = 'trustedFolders.json';
-export const SETTINGS_DIRECTORY_NAME = '.blackboxcli';
-export const USER_SETTINGS_DIR = path.join(homedir(), SETTINGS_DIRECTORY_NAME);
 export const USER_TRUSTED_FOLDERS_PATH = path.join(
   USER_SETTINGS_DIR,
   TRUSTED_FOLDERS_FILENAME,
